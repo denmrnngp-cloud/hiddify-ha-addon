@@ -174,6 +174,8 @@ echo "[hiddify] Starting sing-box..."
 echo "[hiddify] Binary version: $("$HIDDIFY_BIN" version 2>&1 | head -1)"
 echo "[hiddify] Config: $HIDDIFY_CONFIG"
 
+export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true
+
 "$HIDDIFY_BIN" run \
     -c "$HIDDIFY_CONFIG" \
     2>&1 | while IFS= read -r line; do echo "[core] $line"; done &
