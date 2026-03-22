@@ -17,6 +17,7 @@ SUB_URL=$(jq -r '.subscription_url // ""' "$CONFIG_JSON")
 PROFILE_IDX=$(jq -r '.selected_profile // 0' "$CONFIG_JSON")
 TUN_MODE=$(jq -r '.tun_mode // true' "$CONFIG_JSON")
 LOG_LEVEL=$(jq -r '.log_level // "info"' "$CONFIG_JSON")
+PROXY_DOMAINS=$(jq -r '.proxy_domains // ""' "$CONFIG_JSON")
 
 echo "[hiddify] Starting Hiddify VPN add-on"
 echo "[hiddify] Subscription: ${SUB_URL:0:60}..."
@@ -90,6 +91,7 @@ parse_config() {
         --index "$PROFILE_IDX" \
         $TUN_FLAG \
         --log "$LOG_LEVEL" \
+        --proxy-domains "$PROXY_DOMAINS" \
         --out "$HIDDIFY_CONFIG" 2>&1 | tail -1) || {
         echo "[hiddify] ERROR: Failed to parse subscription"
         ha_state "error" "" "Failed to parse subscription"

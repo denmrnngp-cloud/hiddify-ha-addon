@@ -301,17 +301,25 @@ def parse_subscription(content):
 
 # ── Config builder ─────────────────────────────────────────────────────────────
 
-def build_singbox_config(outbound, tun=True, log_level="info"):
-    # Force the outbound tag to "proxy" so route.final and dns.detour work
+def build_singbox_config(outbound, tun=True, log_level="info", proxy_domains=None):
+    # Force the outbound tag to "proxy" so route rules work
     outbound = dict(outbound)
     outbound["tag"] = "proxy"
+
+    # Build route rules: private IPs always direct, then proxy_domains → proxy, final → direct
+    route_rules = [
+        {"ip_is_private": True, "outbound": "direct"},
+    ]
+    if proxy_domains:
+        route_rules.append({"domain_suffix": proxy_domains, "outbound": "proxy"})
+
     cfg = {
         "log": {"level": log_level, "output": ""},
         "dns": {
             "servers": [
-                {"tag": "dns-proxy", "address": "tls://8.8.8.8", "detour": "proxy"},
+                {"tag": "dns-direct", "address": "8.8.8.8"},
             ],
-            "final": "dns-proxy",
+            "final": "dns-direct",
             "strategy": "prefer_ipv4",
         },
         "outbounds": [
@@ -320,10 +328,8 @@ def build_singbox_config(outbound, tun=True, log_level="info"):
             {"type": "block",  "tag": "block"},
         ],
         "route": {
-            "rules": [
-                {"ip_is_private": True, "outbound": "direct"},
-            ],
-            "final": "proxy",
+            "rules": route_rules,
+            "final": "direct",
             "auto_detect_interface": True,
         },
     }
@@ -354,13 +360,14 @@ def build_singbox_config(outbound, tun=True, log_level="info"):
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url",     required=True, help="Subscription or proxy URL")
-    ap.add_argument("--index",   type=int, default=0, help="Profile index (0 = first)")
-    ap.add_argument("--tun",     action="store_true", default=True)
-    ap.add_argument("--no-tun",  dest="tun", action="store_false")
-    ap.add_argument("--log",     default="info")
-    ap.add_argument("--out",     default="/data/hiddify/config.json")
-    ap.add_argument("--list",    action="store_true", help="List profiles and exit")
+    ap.add_argument("--url",            required=True, help="Subscription or proxy URL")
+    ap.add_argument("--index",          type=int, default=0, help="Profile index (0 = first)")
+    ap.add_argument("--tun",            action="store_true", default=True)
+    ap.add_argument("--no-tun",         dest="tun", action="store_false")
+    ap.add_argument("--log",            default="info")
+    ap.add_argument("--out",            default="/data/hiddify/config.json")
+    ap.add_argument("--list",           action="store_true", help="List profiles and exit")
+    ap.add_argument("--proxy-domains",  default="", help="Comma-separated domain suffixes to route via proxy (default: all traffic)")
     args = ap.parse_args()
 
     url = args.url.strip()
@@ -392,7 +399,8 @@ def main():
     name, outbound = proxies[idx]
     print(f"[parse_sub] Using profile [{idx}]: {name}", file=sys.stderr)
 
-    cfg = build_singbox_config(outbound, tun=args.tun, log_level=args.log)
+    proxy_domains = [d.strip() for d in args.proxy_domains.split(",") if d.strip()] if args.proxy_domains else None
+    cfg = build_singbox_config(outbound, tun=args.tun, log_level=args.log, proxy_domains=proxy_domains)
 
     import os
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
