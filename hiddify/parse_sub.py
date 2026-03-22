@@ -306,13 +306,9 @@ def build_singbox_config(outbound, tun=True, log_level="info"):
         "log": {"level": log_level, "output": ""},
         "dns": {
             "servers": [
-                {"tag": "dns-remote", "address": "tls://8.8.8.8", "detour": "proxy"},
-                {"tag": "dns-local",  "address": "223.5.5.5",     "detour": "direct"},
+                {"tag": "dns-proxy", "address": "tls://8.8.8.8", "detour": "proxy"},
             ],
-            "rules": [
-                {"outbound": "any", "server": "dns-local"},
-            ],
-            "final": "dns-remote",
+            "final": "dns-proxy",
             "strategy": "prefer_ipv4",
         },
         "outbounds": [
