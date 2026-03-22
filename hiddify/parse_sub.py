@@ -334,8 +334,7 @@ def build_singbox_config(outbound, tun=True, log_level="info"):
         cfg["inbounds"] = [{
             "type": "tun",
             "tag": "tun-in",
-            "inet4_address": "172.19.0.1/30",
-            "inet6_address": "fdfe:dcba:9876::1/126",
+            "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
             "mtu": 1500,
             "auto_route": True,
             "strict_route": True,
