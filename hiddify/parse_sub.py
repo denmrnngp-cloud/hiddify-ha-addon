@@ -337,7 +337,7 @@ def build_singbox_config(outbound, tun=True, log_level="info"):
             "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
             "mtu": 1500,
             "auto_route": True,
-            "strict_route": True,
+            "strict_route": False,
             "stack": "system",
             "sniff": True,
             "sniff_override_destination": True,

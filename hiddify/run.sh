@@ -193,9 +193,13 @@ else
 fi
 
 echo "[hiddify] PID: $HIDDIFY_PID"
+echo "[hiddify] /dev/net/tun: $(ls -la /dev/net/tun 2>&1)"
+echo "[hiddify] Interfaces after Core.Start: $(ip -br link show 2>/dev/null | tr '\n' ' ')"
 
 # Wait a moment for TUN to come up
-sleep 5
+sleep 8
+
+echo "[hiddify] Interfaces after wait: $(ip -br link show 2>/dev/null | tr '\n' ' ')"
 
 if [ "$TUN_MODE" = "true" ]; then
     if ip link show tun0 >/dev/null 2>&1; then
