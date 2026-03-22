@@ -183,6 +183,15 @@ cd /data/hiddify/work
 HIDDIFY_PID=$!
 cd /
 
+# Wait for gRPC server to be ready, then send Core.Start
+echo "[hiddify] Waiting for gRPC server on port 17078..."
+if python3 /grpc_ctl.py wait --timeout 20; then
+    echo "[hiddify] gRPC ready — sending Core.Start"
+    python3 /grpc_ctl.py start && echo "[hiddify] Core.Start sent" || echo "[hiddify] Core.Start failed"
+else
+    echo "[hiddify] gRPC timeout — proceeding anyway"
+fi
+
 echo "[hiddify] PID: $HIDDIFY_PID"
 
 # Wait a moment for TUN to come up
