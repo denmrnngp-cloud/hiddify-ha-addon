@@ -100,7 +100,13 @@ def main():
             sys.exit(1)
 
     if args.action == 'start':
-        ok, resp = grpc_call('/hiddify.v1.CoreService/Start', port=args.port)
+        # Try with config_path in protobuf body (field 1, string)
+        config_path = b'/data/hiddify/work/data/current-config.json'
+        body = bytes([0x0a, len(config_path)]) + config_path
+        ok, resp = grpc_call('/hiddify.v1.CoreService/Start', body=body, port=args.port)
+        if not ok:
+            # Fallback: empty body
+            ok, resp = grpc_call('/hiddify.v1.CoreService/Start', body=b'', port=args.port)
     elif args.action == 'stop':
         ok, resp = grpc_call('/hiddify.v1.CoreService/Stop', port=args.port)
     elif args.action == 'status':

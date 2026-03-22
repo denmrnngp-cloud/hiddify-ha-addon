@@ -209,6 +209,11 @@ if [ "$TUN_MODE" = "true" ]; then
     else
         echo "[hiddify] Waiting for TUN interface..."
         ha_state "connecting" "" "$PROFILE_NAME"
+        # hiddify-core v4 may need explicit TUN start - try sing-box config directly
+        if [ -f /data/hiddify/work/data/current-config.json ]; then
+            echo "[hiddify] Trying converted config from hiddify-core..."
+            cat /data/hiddify/work/data/current-config.json | head -5
+        fi
     fi
 else
     ha_state "connected" "" "$PROFILE_NAME"
