@@ -3,7 +3,7 @@ set -euo pipefail
 
 CONFIG_JSON="/data/options.json"
 HIDDIFY_CONFIG="/data/hiddify/config.json"
-HIDDIFY_BIN="/usr/local/bin/hiddify-core"
+HIDDIFY_BIN="/usr/local/bin/sing-box"
 STATE_FILE="/data/hiddify/state.json"
 LOG_FILE="/data/hiddify/hiddify.log"
 HA_URL="http://supervisor/core/api"
@@ -152,7 +152,7 @@ cleanup() {
     ha_state "disconnected" "" ""
     [ -n "${HIDDIFY_PID:-}" ] && kill "$HIDDIFY_PID" 2>/dev/null || true
     wait "${HIDDIFY_PID:-}" 2>/dev/null || true
-    # Remove TUN routes
+    # Remove TUN interface
     ip link delete tun0 2>/dev/null || true
     exit 0
 }
@@ -170,27 +170,14 @@ PROFILE_NAME=$(parse_config) || {
     exit 1
 }
 
-echo "[hiddify] Starting hiddify-core..."
+echo "[hiddify] Starting sing-box..."
 echo "[hiddify] Binary version: $("$HIDDIFY_BIN" version 2>&1 | head -1)"
 echo "[hiddify] Config: $HIDDIFY_CONFIG"
 
-mkdir -p /data/hiddify/work
-cd /data/hiddify/work
-
 "$HIDDIFY_BIN" run \
-    --config "$HIDDIFY_CONFIG" \
+    -c "$HIDDIFY_CONFIG" \
     2>&1 | while IFS= read -r line; do echo "[core] $line"; done &
 HIDDIFY_PID=$!
-cd /
-
-# Wait for gRPC server to be ready, then send Core.Start
-echo "[hiddify] Waiting for gRPC server on port 17078..."
-if python3 /grpc_ctl.py wait --timeout 20; then
-    echo "[hiddify] gRPC ready — sending Core.Start"
-    python3 /grpc_ctl.py start && echo "[hiddify] Core.Start sent" || echo "[hiddify] Core.Start failed"
-else
-    echo "[hiddify] gRPC timeout — proceeding anyway"
-fi
 
 echo "[hiddify] PID: $HIDDIFY_PID"
 echo "[hiddify] /dev/net/tun: $(ls -la /dev/net/tun 2>&1)"
