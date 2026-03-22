@@ -19,7 +19,7 @@ schema:
   subscription_url: str
   selected_profile: int
   tun_mode: bool
-  log_level: "info|debug|warn|error"
+  log_level: list(info|debug|warn|error)
 
 ports:
   17078/tcp: null
