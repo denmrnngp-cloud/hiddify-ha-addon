@@ -318,14 +318,11 @@ def build_singbox_config(outbound, tun=True, log_level="info"):
         "outbounds": [
             outbound,
             {"type": "direct", "tag": "direct"},
-            {"type": "block", "tag": "block"},
-            {"type": "dns", "tag": "dns-out"},
+            {"type": "block",  "tag": "block"},
         ],
         "route": {
             "rules": [
-                {"protocol": "dns", "outbound": "dns-out"},
-                {"geoip": ["private"], "outbound": "direct"},
-                {"geosite": ["cn"], "outbound": "direct"},
+                {"ip_is_private": True, "outbound": "direct"},
             ],
             "final": "proxy",
             "auto_detect_interface": True,
