@@ -345,14 +345,12 @@ def build_singbox_config(outbound, tun=True, log_level="info", proxy_domains=Non
             "stack": "system",
             "sniff": True,
             "sniff_override_destination": True,
-            "inet4_route_exclude_address": [
+            "route_exclude_address": [
                 "10.0.0.0/8",
                 "172.16.0.0/12",
                 "192.168.0.0/16",
                 "127.0.0.0/8",
                 "169.254.0.0/16",
-            ],
-            "inet6_route_exclude_address": [
                 "fc00::/7",
                 "fe80::/10",
                 "::1/128",
