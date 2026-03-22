@@ -302,6 +302,9 @@ def parse_subscription(content):
 # ── Config builder ─────────────────────────────────────────────────────────────
 
 def build_singbox_config(outbound, tun=True, log_level="info"):
+    # Force the outbound tag to "proxy" so route.final and dns.detour work
+    outbound = dict(outbound)
+    outbound["tag"] = "proxy"
     cfg = {
         "log": {"level": log_level, "output": ""},
         "dns": {
