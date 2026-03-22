@@ -306,12 +306,17 @@ def build_singbox_config(outbound, tun=True, log_level="info", proxy_domains=Non
     outbound = dict(outbound)
     outbound["tag"] = "proxy"
 
-    # Build route rules: private IPs always direct, then proxy_domains → proxy, final → direct
+    # Route rules: private/multicast IPs → direct (these bypass TUN via route_exclude_address
+    # but also listed here as safety). All other public traffic → proxy (VPN).
+    # proxy_domains is kept for backwards compatibility but SNI sniffing is unreliable;
+    # the reliable approach is to proxy ALL public traffic and exclude private ranges from TUN.
     route_rules = [
         {"ip_is_private": True, "outbound": "direct"},
     ]
-    if proxy_domains:
-        route_rules.append({"domain_suffix": proxy_domains, "outbound": "proxy"})
+
+    # Route to exclude from proxy (go direct even if public): user-specified domains
+    # Note: SNI-based domain matching requires sniffing which may not always work.
+    # The final "proxy" handles everything else (Spotify, etc.) via VPN.
 
     cfg = {
         "log": {"level": log_level, "output": ""},
@@ -329,10 +334,26 @@ def build_singbox_config(outbound, tun=True, log_level="info", proxy_domains=Non
         ],
         "route": {
             "rules": route_rules,
-            "final": "direct",
+            "final": "proxy",
             "auto_detect_interface": True,
         },
     }
+
+    # Ranges excluded from TUN routing entirely (bypass TUN, go direct via host network).
+    # This keeps local LAN, Docker networks, mDNS multicast, and loopback working normally.
+    tun_exclude = [
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "224.0.0.0/4",   # multicast (mDNS, UPnP/SSDP, etc.)
+        "240.0.0.0/4",   # reserved/broadcast
+        "fc00::/7",
+        "fe80::/10",
+        "::1/128",
+        "ff00::/8",      # IPv6 multicast
+    ]
 
     if tun:
         cfg["inbounds"] = [{
@@ -345,16 +366,7 @@ def build_singbox_config(outbound, tun=True, log_level="info", proxy_domains=Non
             "stack": "system",
             "sniff": True,
             "sniff_override_destination": True,
-            "route_exclude_address": [
-                "10.0.0.0/8",
-                "172.16.0.0/12",
-                "192.168.0.0/16",
-                "127.0.0.0/8",
-                "169.254.0.0/16",
-                "fc00::/7",
-                "fe80::/10",
-                "::1/128",
-            ],
+            "route_exclude_address": tun_exclude,
         }]
     else:
         cfg["inbounds"] = [
