@@ -37,7 +37,7 @@ capabilities:
   - NET_RAW
   - NET_BIND_SERVICE
 
-host_network: false
+host_network: true
 
 kernel_modules:
   - tun

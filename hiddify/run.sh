@@ -171,10 +171,11 @@ PROFILE_NAME=$(parse_config) || {
 }
 
 echo "[hiddify] Starting hiddify-core..."
+echo "[hiddify] Binary version: $("$HIDDIFY_BIN" version 2>&1 | head -1)"
+echo "[hiddify] Running: $HIDDIFY_BIN run --config $HIDDIFY_CONFIG"
 "$HIDDIFY_BIN" run \
     --config "$HIDDIFY_CONFIG" \
-    --log-level "$LOG_LEVEL" \
-    > "$LOG_FILE" 2>&1 &
+    2>&1 | tee "$LOG_FILE" | sed 's/^/[core] /' &
 HIDDIFY_PID=$!
 
 echo "[hiddify] PID: $HIDDIFY_PID"
