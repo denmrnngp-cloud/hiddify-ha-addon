@@ -46,7 +46,5 @@ map:
   - config:rw
   - ssl:ro
 
-image: "ghcr.io/denmrnngp-cloud/hiddify-ha-addon/{arch}"
-
 panel_icon: mdi:vpn
 panel_title: Hiddify VPN
