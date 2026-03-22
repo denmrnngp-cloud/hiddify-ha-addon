@@ -15,7 +15,9 @@ RUN apk add --no-cache \
     ca-certificates \
     iptables \
     ip6tables \
-    tzdata
+    tzdata \
+    gcompat \
+    libc6-compat
 
 # Download sing-box binary
 RUN case "${BUILD_ARCH}" in \
