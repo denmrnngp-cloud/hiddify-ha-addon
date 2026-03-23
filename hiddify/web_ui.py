@@ -69,6 +69,23 @@ def _stats():
     }
 
 
+def _run_speedtest():
+    """Download 10 MB from Cloudflare via tun0, return Mbit/s."""
+    try:
+        out = subprocess.check_output(
+            ["curl", "-s", "-o", "/dev/null",
+             "-w", "%{speed_download}",
+             "--max-time", "25",
+             "https://speed.cloudflare.com/__down?bytes=10000000"],
+            timeout=30
+        )
+        bps = float(out.decode().strip())
+        mbps = round(bps * 8 / 1_000_000, 1)
+        return {"ok": True, "down_mbps": mbps}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def _addon_action(action):
     """Call ha supervisor CLI to start/stop/restart addon."""
     slug = os.environ.get("ADDON_SLUG", "self")
@@ -248,6 +265,21 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- speed test card -->
+  <div class="card" style="display:flex;flex-direction:column;gap:10px">
+    <div class="label" style="margin-bottom:0">Speed Test (via VPN)</div>
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+      <button class="btn btn-on" id="btn-speed" onclick="runSpeed()" style="flex:0 0 auto;min-width:140px">⚡ Run Test</button>
+      <div style="display:flex;gap:24px;flex:1">
+        <div>
+          <div class="label">↓ Download</div>
+          <div class="value" id="speed-down" style="font-size:22px">—</div>
+        </div>
+      </div>
+    </div>
+    <div class="msg" id="speed-msg"></div>
+  </div>
+
   <!-- controls -->
   <div class="card" style="display:flex;flex-direction:column;gap:12px">
     <div class="label" style="margin-bottom:0">VPN Control</div>
@@ -264,7 +296,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="msg" id="msg"></div>
   </div>
 
-  <div class="footer">Updates every 2 s · Hiddify VPN 1.9.0</div>
+  <div class="footer">Updates every 2 s · Hiddify VPN 2.0.0</div>
 </div>
 
 <script>
@@ -377,6 +409,34 @@ async function switchProfile() {
   setTimeout(poll, 3000);
 }
 
+async function runSpeed() {
+  const btn = document.getElementById("btn-speed");
+  const msg = document.getElementById("speed-msg");
+  const val = document.getElementById("speed-down");
+  btn.disabled = true;
+  val.textContent = "…";
+  msg.textContent = "Running 10 MB download test via VPN…";
+  msg.style.color = "var(--muted)";
+  try {
+    const r = await fetch("speedtest");
+    const d = await r.json();
+    if (d.ok) {
+      val.textContent = d.down_mbps + " Mbit/s";
+      msg.textContent = "Test complete";
+    } else {
+      val.textContent = "—";
+      msg.textContent = "Error: " + (d.error || "unknown");
+      msg.style.color = "var(--red)";
+    }
+  } catch(e) {
+    val.textContent = "—";
+    msg.textContent = "Request failed";
+    msg.style.color = "var(--red)";
+  }
+  btn.disabled = false;
+  setTimeout(() => { if(msg.textContent==="Test complete") msg.textContent=""; }, 4000);
+}
+
 poll();
 setInterval(poll, 2000);
 </script>
@@ -415,6 +475,17 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path.endswith("/stats") or path == "/stats":
             self._json(200, _stats())
+
+        elif path.endswith("/speedtest"):
+            # Long-running — run in thread so server stays responsive
+            import threading
+            result = {}
+            def _run():
+                result.update(_run_speedtest())
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            t.join(timeout=35)
+            self._json(200, result if result else {"ok": False, "error": "timeout"})
 
         elif path.endswith("/icon.png"):
             try:

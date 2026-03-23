@@ -146,6 +146,19 @@ print(json.dumps(out))
     echo "$PROFILE_NAME"
 }
 
+# ── Trigger HA speedtest integration ──────────────────────────────────────────
+
+trigger_speedtest() {
+    if [ -n "${HA_TOKEN:-}" ]; then
+        curl -s -X POST \
+          -H "Authorization: Bearer $HA_TOKEN" \
+          -H "Content-Type: application/json" \
+          "$HA_URL/services/speedtestdotnet/speedtest" \
+          -d '{}' >/dev/null 2>&1 || true
+        echo "[hiddify] Triggered HA speedtest integration"
+    fi
+}
+
 # ── Get external IP ────────────────────────────────────────────────────────────
 
 get_ip() {
@@ -179,6 +192,7 @@ monitor_loop() {
                     echo "[hiddify] Connected. IP: $VPN_IP  Profile: $profile"
                     ha_state "connected" "$VPN_IP" "$profile"
                     prev_status="connected"
+                    trigger_speedtest &
                 fi
             else
                 if [ "$prev_status" != "connecting" ]; then
@@ -241,6 +255,7 @@ if [ "$TUN_MODE" = "true" ]; then
         VPN_IP=$(get_ip)
         echo "[hiddify] VPN up. External IP: $VPN_IP"
         ha_state "connected" "$VPN_IP" "$PROFILE_NAME"
+        trigger_speedtest &
     else
         echo "[hiddify] Waiting for TUN interface..."
         ha_state "connecting" "" "$PROFILE_NAME"
