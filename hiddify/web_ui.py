@@ -70,20 +70,28 @@ def _stats():
 
 
 def _run_speedtest():
-    """Download 10 MB from Cloudflare via tun0, return Mbit/s."""
-    try:
-        out = subprocess.check_output(
-            ["curl", "-s", "-o", "/dev/null",
-             "-w", "%{speed_download}",
-             "--max-time", "25",
-             "https://speed.cloudflare.com/__down?bytes=10000000"],
-            timeout=30
-        )
-        bps = float(out.decode().strip())
-        mbps = round(bps * 8 / 1_000_000, 1)
-        return {"ok": True, "down_mbps": mbps}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    """Download 10 MB and return Mbit/s. Tries HTTPS then HTTP fallback."""
+    urls = [
+        "https://speed.cloudflare.com/__down?bytes=10000000",
+        "http://speed.cloudflare.com/__down?bytes=10000000",
+        "http://speedtest.tele2.net/10MB.zip",
+    ]
+    last_err = ""
+    for url in urls:
+        try:
+            out = subprocess.check_output(
+                ["curl", "-s", "-k", "-o", "/dev/null",
+                 "-w", "%{speed_download}",
+                 "--max-time", "25", url],
+                timeout=30, stderr=subprocess.DEVNULL
+            )
+            bps = float(out.decode().strip())
+            if bps > 0:
+                mbps = round(bps * 8 / 1_000_000, 1)
+                return {"ok": True, "down_mbps": mbps}
+        except Exception as e:
+            last_err = str(e)
+    return {"ok": False, "error": last_err or "all URLs failed"}
 
 
 def _addon_action(action):
