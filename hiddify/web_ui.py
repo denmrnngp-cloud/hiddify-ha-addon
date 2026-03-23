@@ -70,24 +70,36 @@ def _stats():
 
 
 def _run_speedtest():
-    """Download 10 MB and return Mbit/s. Tries HTTPS then HTTP fallback."""
+    """Download 10 MB via Python urllib and return Mbit/s."""
+    import urllib.request, ssl as _ssl
+
     urls = [
         "https://speed.cloudflare.com/__down?bytes=10000000",
         "http://speed.cloudflare.com/__down?bytes=10000000",
-        "http://speedtest.tele2.net/10MB.zip",
+        "https://ash-speed.hetzner.com/10MB.bin",
     ]
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+
     last_err = ""
     for url in urls:
         try:
-            out = subprocess.check_output(
-                ["curl", "-s", "-k", "-o", "/dev/null",
-                 "-w", "%{speed_download}",
-                 "--max-time", "25", url],
-                timeout=30, stderr=subprocess.DEVNULL
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=ctx)
             )
-            bps = float(out.decode().strip())
-            if bps > 0:
-                mbps = round(bps * 8 / 1_000_000, 1)
+            t0 = time.time()
+            total = 0
+            with opener.open(req, timeout=25) as r:
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+            elapsed = time.time() - t0
+            if total > 0 and elapsed > 0:
+                mbps = round(total * 8 / elapsed / 1_000_000, 1)
                 return {"ok": True, "down_mbps": mbps}
         except Exception as e:
             last_err = str(e)
@@ -304,7 +316,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="msg" id="msg"></div>
   </div>
 
-  <div class="footer">Updates every 2 s · Hiddify VPN 2.0.1</div>
+  <div class="footer">Updates every 2 s · Hiddify VPN 2.0.2</div>
 </div>
 
 <script>
