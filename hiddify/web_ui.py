@@ -304,7 +304,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="msg" id="msg"></div>
   </div>
 
-  <div class="footer">Updates every 2 s · Hiddify VPN 2.0.0</div>
+  <div class="footer">Updates every 2 s · Hiddify VPN 2.0.1</div>
 </div>
 
 <script>
