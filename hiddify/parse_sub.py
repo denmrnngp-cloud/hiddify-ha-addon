@@ -308,10 +308,13 @@ def build_singbox_config(outbound, tun=True, log_level="info", proxy_domains=Non
 
     # Route rules: private/multicast IPs → direct (these bypass TUN via route_exclude_address
     # but also listed here as safety). All other public traffic → proxy (VPN).
-    # proxy_domains is kept for backwards compatibility but SNI sniffing is unreliable;
-    # the reliable approach is to proxy ALL public traffic and exclude private ranges from TUN.
+    # Tailscale control-plane domains go direct so Tailscale works alongside the VPN.
     route_rules = [
         {"ip_is_private": True, "outbound": "direct"},
+        {
+            "domain_suffix": ["tailscale.com", "tailscale.io", "tailscale.net"],
+            "outbound": "direct",
+        },
     ]
 
     # Route to exclude from proxy (go direct even if public): user-specified domains
@@ -347,6 +350,7 @@ def build_singbox_config(outbound, tun=True, log_level="info", proxy_domains=Non
         "192.168.0.0/16",
         "127.0.0.0/8",
         "169.254.0.0/16",
+        "100.64.0.0/10",  # Tailscale CGNAT (device-to-device traffic)
         "224.0.0.0/4",   # multicast (mDNS, UPnP/SSDP, etc.)
         "240.0.0.0/4",   # reserved/broadcast
         "fc00::/7",
