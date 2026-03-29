@@ -230,39 +230,43 @@ PROFILE_NAME=$(parse_config) || {
     exit 1
 }
 
-echo "[hiddify] Starting sing-box..."
-echo "[hiddify] Binary version: $("$HIDDIFY_BIN" version 2>&1 | head -1)"
-echo "[hiddify] Config: $HIDDIFY_CONFIG"
+start_singbox() {
+    echo "[hiddify] Starting sing-box..."
+    echo "[hiddify] Binary version: $("$HIDDIFY_BIN" version 2>&1 | head -1)"
+    echo "[hiddify] Config: $HIDDIFY_CONFIG"
 
-export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true
+    export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true
+    rm -f /data/hiddify/vpn_stop_requested /data/hiddify/vpn_start_requested
 
-"$HIDDIFY_BIN" run \
-    -c "$HIDDIFY_CONFIG" \
-    2>&1 | while IFS= read -r line; do echo "[core] $line"; done &
-HIDDIFY_PID=$!
+    "$HIDDIFY_BIN" run \
+        -c "$HIDDIFY_CONFIG" \
+        2>&1 | while IFS= read -r line; do echo "[core] $line"; done &
+    HIDDIFY_PID=$!
+    echo "$HIDDIFY_PID" > /data/hiddify/singbox.pid
 
-echo "[hiddify] PID: $HIDDIFY_PID"
-echo "[hiddify] /dev/net/tun: $(ls -la /dev/net/tun 2>&1)"
-echo "[hiddify] Interfaces after Core.Start: $(ip -br link show 2>/dev/null | tr '\n' ' ')"
+    echo "[hiddify] PID: $HIDDIFY_PID"
+    echo "[hiddify] /dev/net/tun: $(ls -la /dev/net/tun 2>&1)"
+    echo "[hiddify] Interfaces after Core.Start: $(ip -br link show 2>/dev/null | tr '\n' ' ')"
 
-# Wait a moment for TUN to come up
-sleep 8
+    sleep 8
+    echo "[hiddify] Interfaces after wait: $(ip -br link show 2>/dev/null | tr '\n' ' ')"
 
-echo "[hiddify] Interfaces after wait: $(ip -br link show 2>/dev/null | tr '\n' ' ')"
-
-if [ "$TUN_MODE" = "true" ]; then
-    if ip link show tun0 >/dev/null 2>&1; then
-        VPN_IP=$(get_ip)
-        echo "[hiddify] VPN up. External IP: $VPN_IP"
-        ha_state "connected" "$VPN_IP" "$PROFILE_NAME"
-        trigger_speedtest &
+    if [ "$TUN_MODE" = "true" ]; then
+        if ip link show tun0 >/dev/null 2>&1; then
+            VPN_IP=$(get_ip)
+            echo "[hiddify] VPN up. External IP: $VPN_IP"
+            ha_state "connected" "$VPN_IP" "$PROFILE_NAME"
+            trigger_speedtest &
+        else
+            echo "[hiddify] Waiting for TUN interface..."
+            ha_state "connecting" "" "$PROFILE_NAME"
+        fi
     else
-        echo "[hiddify] Waiting for TUN interface..."
-        ha_state "connecting" "" "$PROFILE_NAME"
+        ha_state "connected" "" "$PROFILE_NAME"
     fi
-else
-    ha_state "connected" "" "$PROFILE_NAME"
-fi
+}
+
+start_singbox
 
 # ── Register custom icon in HA Lovelace ───────────────────────────────────────
 
@@ -303,12 +307,45 @@ WEB_PID=$!
 monitor_loop "$PROFILE_NAME" &
 MONITOR_PID=$!
 
-# Wait for sing-box to exit
-wait "$HIDDIFY_PID"
-EXIT_CODE=$?
+# ── Control loop — handles stop/start requests from web UI ────────────────────
+while true; do
+    # Poll every 2s for stop request or sing-box exit
+    sleep 2
 
-kill "$MONITOR_PID" 2>/dev/null || true
-kill "$WEB_PID"     2>/dev/null || true
-echo "[hiddify] sing-box exited with code $EXIT_CODE"
-ha_state "disconnected" "" ""
-exit "$EXIT_CODE"
+    # Stop requested by web UI
+    if [ -f /data/hiddify/vpn_stop_requested ]; then
+        echo "[hiddify] Stop requested by web UI"
+        kill "$MONITOR_PID" 2>/dev/null || true
+        kill "$HIDDIFY_PID" 2>/dev/null || true
+        wait "$HIDDIFY_PID" 2>/dev/null || true
+        ip link delete tun0 2>/dev/null || true
+        ha_state "disconnected" "" ""
+        rm -f /data/hiddify/vpn_stop_requested
+
+        # Wait for start request (web UI is still alive)
+        echo "[hiddify] VPN stopped. Waiting for start request..."
+        while true; do
+            sleep 2
+            if [ -f /data/hiddify/vpn_start_requested ]; then
+                echo "[hiddify] Start requested by web UI"
+                rm -f /data/hiddify/vpn_start_requested
+                start_singbox
+                monitor_loop "$PROFILE_NAME" &
+                MONITOR_PID=$!
+                break
+            fi
+        done
+        continue
+    fi
+
+    # sing-box exited on its own (crash or SIGTERM from HA)
+    if ! kill -0 "$HIDDIFY_PID" 2>/dev/null; then
+        wait "$HIDDIFY_PID" 2>/dev/null
+        EXIT_CODE=$?
+        kill "$MONITOR_PID" 2>/dev/null || true
+        kill "$WEB_PID"     2>/dev/null || true
+        echo "[hiddify] sing-box exited with code $EXIT_CODE"
+        ha_state "disconnected" "" ""
+        exit "$EXIT_CODE"
+    fi
+done

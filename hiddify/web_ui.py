@@ -14,11 +14,13 @@ import subprocess
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-STATE_FILE    = "/data/hiddify/state.json"
-PROFILES_FILE = "/data/hiddify/profiles.json"
-TUN_STATS     = "/sys/class/net/tun0/statistics"
-OPTIONS_FILE  = "/data/options.json"
-ICON_FILE     = "/icon.png"
+STATE_FILE       = "/data/hiddify/state.json"
+PROFILES_FILE    = "/data/hiddify/profiles.json"
+TUN_STATS        = "/sys/class/net/tun0/statistics"
+OPTIONS_FILE     = "/data/options.json"
+ICON_FILE        = "/icon.png"
+VPN_STOP_FLAG    = "/data/hiddify/vpn_stop_requested"
+VPN_START_FLAG   = "/data/hiddify/vpn_start_requested"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -106,12 +108,24 @@ def _run_speedtest():
     return {"ok": False, "error": last_err or "all URLs failed"}
 
 
-def _addon_action(action):
-    """Call ha supervisor CLI to start/stop/restart addon."""
-    slug = os.environ.get("ADDON_SLUG", "self")
-    cmd = ["ha", "apps", action, slug]
+def _vpn_stop():
+    """Request VPN stop via flag file — run.sh kills sing-box and waits."""
     try:
-        subprocess.run(cmd, timeout=10, check=False)
+        # Remove stale start flag if any
+        if os.path.exists(VPN_START_FLAG):
+            os.remove(VPN_START_FLAG)
+        open(VPN_STOP_FLAG, "w").close()
+        return True
+    except Exception:
+        return False
+
+
+def _vpn_start():
+    """Request VPN start via flag file — run.sh detects and restarts sing-box."""
+    try:
+        if os.path.exists(VPN_STOP_FLAG):
+            os.remove(VPN_STOP_FLAG)
+        open(VPN_START_FLAG, "w").close()
         return True
     except Exception:
         return False
@@ -528,17 +542,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path.rstrip("/")
 
-        # VPN start / stop / restart
+        # VPN start / stop
         if path.endswith("/vpn/start"):
-            ok = _addon_action("start")
+            ok = _vpn_start()
             self._json(200, {"ok": ok})
 
         elif path.endswith("/vpn/stop"):
-            ok = _addon_action("stop")
-            self._json(200, {"ok": ok})
-
-        elif path.endswith("/vpn/restart"):
-            ok = _addon_action("restart")
+            ok = _vpn_stop()
             self._json(200, {"ok": ok})
 
         # Profile switch
