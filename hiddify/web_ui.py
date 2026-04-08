@@ -762,6 +762,15 @@ class Handler(BaseHTTPRequestHandler):
                 _write_json(ACTIVE_PROFILE_FILE, {
                     "sub_id": sub_id, "profile_index": idx, "profile_name": pname,
                 })
+                # Sync to options.json so HA config panel reflects current selection
+                opts = _read_json(OPTIONS_FILE)
+                opts["subscription_url"]  = sub["url"]
+                opts["selected_profile"]  = idx
+                try:
+                    with open(OPTIONS_FILE, "w") as f:
+                        json.dump(opts, f, indent=2)
+                except Exception:
+                    pass
                 _vpn_restart()
                 self._json(200, {"ok": True})
             else:
