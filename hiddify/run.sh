@@ -6,6 +6,8 @@ HIDDIFY_CONFIG="/data/hiddify/config.json"
 HIDDIFY_BIN="/usr/local/bin/sing-box"
 STATE_FILE="/data/hiddify/state.json"
 PROFILES_FILE="/data/hiddify/profiles.json"
+SUBSCRIPTIONS_FILE="/data/hiddify/subscriptions.json"
+ACTIVE_PROFILE_FILE="/data/hiddify/active_profile.json"
 LOG_FILE="/data/hiddify/hiddify.log"
 HA_URL="http://supervisor/core/api"
 HA_TOKEN="${SUPERVISOR_TOKEN:-}"
@@ -14,11 +16,27 @@ mkdir -p /data/hiddify
 
 # ── Read add-on options ────────────────────────────────────────────────────────
 
-SUB_URL=$(jq -r '.subscription_url // ""' "$CONFIG_JSON")
-PROFILE_IDX=$(jq -r '.selected_profile // 0' "$CONFIG_JSON")
 TUN_MODE=$(jq -r '.tun_mode // true' "$CONFIG_JSON")
 LOG_LEVEL=$(jq -r '.log_level // "info"' "$CONFIG_JSON")
 PROXY_DOMAINS=$(jq -r '.proxy_domains // ""' "$CONFIG_JSON")
+
+# Multi-subscription: prefer active_profile.json + subscriptions.json over options.json
+if [ -f "$ACTIVE_PROFILE_FILE" ] && [ -f "$SUBSCRIPTIONS_FILE" ]; then
+    _ACTIVE_SUB_ID=$(jq -r '.sub_id // ""' "$ACTIVE_PROFILE_FILE")
+    _ACTIVE_IDX=$(jq -r '.profile_index // 0' "$ACTIVE_PROFILE_FILE")
+    _ACTIVE_URL=$(jq -r --arg id "$_ACTIVE_SUB_ID" '.[] | select(.id == $id) | .url' "$SUBSCRIPTIONS_FILE" 2>/dev/null || echo "")
+    if [ -n "$_ACTIVE_URL" ]; then
+        SUB_URL="$_ACTIVE_URL"
+        PROFILE_IDX="$_ACTIVE_IDX"
+        echo "[hiddify] Using subscription from UI: sub_id=$_ACTIVE_SUB_ID profile=$PROFILE_IDX"
+    else
+        SUB_URL=$(jq -r '.subscription_url // ""' "$CONFIG_JSON")
+        PROFILE_IDX=$(jq -r '.selected_profile // 0' "$CONFIG_JSON")
+    fi
+else
+    SUB_URL=$(jq -r '.subscription_url // ""' "$CONFIG_JSON")
+    PROFILE_IDX=$(jq -r '.selected_profile // 0' "$CONFIG_JSON")
+fi
 
 echo "[hiddify] Starting Hiddify VPN add-on"
 echo "[hiddify] Subscription: ${SUB_URL:0:60}..."
@@ -311,6 +329,31 @@ MONITOR_PID=$!
 while true; do
     # Poll every 2s for stop request or sing-box exit
     sleep 2
+
+    # Profile switch / restart requested by web UI
+    if [ -f /data/hiddify/vpn_restart_requested ]; then
+        echo "[hiddify] Restart requested (profile switch)"
+        rm -f /data/hiddify/vpn_restart_requested
+        kill "$MONITOR_PID" 2>/dev/null || true
+        kill "$HIDDIFY_PID" 2>/dev/null || true
+        wait "$HIDDIFY_PID" 2>/dev/null || true
+        ip link delete tun0 2>/dev/null || true
+        ha_state "connecting" "" "Reloading profile…"
+
+        # Re-read active subscription (may have changed via UI)
+        if [ -f "$ACTIVE_PROFILE_FILE" ] && [ -f "$SUBSCRIPTIONS_FILE" ]; then
+            _SUB_ID=$(jq -r '.sub_id // ""' "$ACTIVE_PROFILE_FILE")
+            _IDX=$(jq -r '.profile_index // 0' "$ACTIVE_PROFILE_FILE")
+            _URL=$(jq -r --arg id "$_SUB_ID" '.[] | select(.id == $id) | .url' "$SUBSCRIPTIONS_FILE" 2>/dev/null || echo "")
+            [ -n "$_URL" ] && SUB_URL="$_URL" && PROFILE_IDX="$_IDX"
+        fi
+
+        PROFILE_NAME=$(parse_config) || { sleep 60; exit 1; }
+        start_singbox
+        monitor_loop "$PROFILE_NAME" &
+        MONITOR_PID=$!
+        continue
+    fi
 
     # Stop requested by web UI
     if [ -f /data/hiddify/vpn_stop_requested ]; then

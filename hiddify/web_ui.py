@@ -5,22 +5,27 @@ Serves on :8080. Features:
   - Real-time uptime counter (HH:MM:SS), resets on VPN restart
   - RX / TX traffic from tun0 interface stats
   - VPN on/off toggle via supervisor API
-  - Profile selector (reads profiles.json written by run.sh)
+  - Multi-subscription management (add/remove/refresh via UI)
+  - Profile selector across all subscriptions
 """
 import json
 import os
 import time
+import uuid
 import subprocess
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-STATE_FILE       = "/data/hiddify/state.json"
-PROFILES_FILE    = "/data/hiddify/profiles.json"
-TUN_STATS        = "/sys/class/net/tun0/statistics"
-OPTIONS_FILE     = "/data/options.json"
-ICON_FILE        = "/icon.png"
-VPN_STOP_FLAG    = "/data/hiddify/vpn_stop_requested"
-VPN_START_FLAG   = "/data/hiddify/vpn_start_requested"
+STATE_FILE          = "/data/hiddify/state.json"
+PROFILES_FILE       = "/data/hiddify/profiles.json"   # legacy single-sub
+SUBSCRIPTIONS_FILE  = "/data/hiddify/subscriptions.json"
+ACTIVE_PROFILE_FILE = "/data/hiddify/active_profile.json"
+TUN_STATS           = "/sys/class/net/tun0/statistics"
+OPTIONS_FILE        = "/data/options.json"
+ICON_FILE           = "/icon.png"
+VPN_STOP_FLAG       = "/data/hiddify/vpn_stop_requested"
+VPN_START_FLAG      = "/data/hiddify/vpn_start_requested"
+VPN_RESTART_FLAG    = "/data/hiddify/vpn_restart_requested"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -33,6 +38,12 @@ def _read_json(path, default=None):
         return default if default is not None else {}
 
 
+def _write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
 def _net_bytes():
     rx = tx = 0
     try:
@@ -43,9 +54,31 @@ def _net_bytes():
     return rx, tx
 
 
+def _read_subscriptions():
+    return _read_json(SUBSCRIPTIONS_FILE, [])
+
+
+def _read_active_profile():
+    return _read_json(ACTIVE_PROFILE_FILE, {})
+
+
+def _fetch_profiles_for_url(url, timeout=30):
+    """Call parse_sub.py --list and return [{index, name}, ...]."""
+    r = subprocess.run(
+        ["python3", "/parse_sub.py", "--url", url, "--list", "--out", "/tmp/probe_sub.json"],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr[-400:] or "parse_sub.py failed")
+    names = json.loads(r.stdout.strip())
+    if not names:
+        raise RuntimeError("No profiles found at this URL")
+    return [{"index": i, "name": n} for i, n in enumerate(names)]
+
+
 def _stats():
-    state = _read_json(STATE_FILE)
-    rx, tx = _net_bytes()
+    state   = _read_json(STATE_FILE)
+    rx, tx  = _net_bytes()
 
     started_at = state.get("started_at")
     uptime_sec = 0
@@ -55,26 +88,68 @@ def _stats():
         except (ValueError, TypeError):
             uptime_sec = 0
 
-    profiles = _read_json(PROFILES_FILE, [])
-    options  = _read_json(OPTIONS_FILE)
-    current_idx = int(options.get("selected_profile", 0))
+    # ── Subscriptions & profiles ─────────────────────────────────────────────
+    subs   = _read_subscriptions()
+    active = _read_active_profile()
+
+    all_profiles = []
+    for sub in subs:
+        for p in sub.get("profiles", []):
+            label = p["name"] if len(subs) <= 1 else f"[{sub['name']}] {p['name']}"
+            is_active = (
+                sub["id"] == active.get("sub_id")
+                and p["index"] == active.get("profile_index", -1)
+            )
+            all_profiles.append({
+                "sub_id": sub["id"],
+                "index":  p["index"],
+                "name":   label,
+                "active": is_active,
+            })
+
+    # Fallback: legacy profiles.json (before multi-sub)
+    if not all_profiles:
+        options     = _read_json(OPTIONS_FILE)
+        current_idx = int(options.get("selected_profile", 0))
+        old         = _read_json(PROFILES_FILE, [])
+        all_profiles = [
+            {"sub_id": "", "index": p["index"], "name": p["name"],
+             "active": p["index"] == current_idx}
+            for p in old
+        ]
+
+    # active profile name for status card
+    active_name = state.get("profile", "")
+    for p in all_profiles:
+        if p.get("active"):
+            active_name = p["name"]
+            break
+
+    # subscriptions summary for UI
+    subs_summary = [
+        {
+            "id":            s["id"],
+            "name":          s["name"],
+            "url_short":     s["url"][:50] + ("…" if len(s["url"]) > 50 else ""),
+            "profile_count": len(s.get("profiles", [])),
+        }
+        for s in subs
+    ]
 
     return {
-        "status":          state.get("status", "unknown"),
-        "ip":              state.get("ip", ""),
-        "profile":         state.get("profile", ""),
-        "uptime_seconds":  uptime_sec,
-        "rx_bytes":        rx,
-        "tx_bytes":        tx,
-        "profiles":        profiles,          # list of {index, name}
-        "selected_profile": current_idx,
+        "status":           state.get("status", "unknown"),
+        "ip":               state.get("ip", ""),
+        "profile":          active_name,
+        "uptime_seconds":   uptime_sec,
+        "rx_bytes":         rx,
+        "tx_bytes":         tx,
+        "profiles":         all_profiles,
+        "subscriptions":    subs_summary,
     }
 
 
 def _run_speedtest():
-    """Download 10 MB via Python urllib and return Mbit/s."""
     import urllib.request, ssl as _ssl
-
     urls = [
         "https://speed.cloudflare.com/__down?bytes=10000000",
         "http://speed.cloudflare.com/__down?bytes=10000000",
@@ -83,14 +158,11 @@ def _run_speedtest():
     ctx = _ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = _ssl.CERT_NONE
-
     last_err = ""
     for url in urls:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
-            opener = urllib.request.build_opener(
-                urllib.request.HTTPSHandler(context=ctx)
-            )
+            req    = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+            opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
             t0 = time.time()
             total = 0
             with opener.open(req, timeout=25) as r:
@@ -101,17 +173,14 @@ def _run_speedtest():
                     total += len(chunk)
             elapsed = time.time() - t0
             if total > 0 and elapsed > 0:
-                mbps = round(total * 8 / elapsed / 1_000_000, 1)
-                return {"ok": True, "down_mbps": mbps}
+                return {"ok": True, "down_mbps": round(total * 8 / elapsed / 1_000_000, 1)}
         except Exception as e:
             last_err = str(e)
     return {"ok": False, "error": last_err or "all URLs failed"}
 
 
 def _vpn_stop():
-    """Request VPN stop via flag file — run.sh kills sing-box and waits."""
     try:
-        # Remove stale start flag if any
         if os.path.exists(VPN_START_FLAG):
             os.remove(VPN_START_FLAG)
         open(VPN_STOP_FLAG, "w").close()
@@ -121,7 +190,6 @@ def _vpn_stop():
 
 
 def _vpn_start():
-    """Request VPN start via flag file — run.sh detects and restarts sing-box."""
     try:
         if os.path.exists(VPN_STOP_FLAG):
             os.remove(VPN_STOP_FLAG)
@@ -131,8 +199,16 @@ def _vpn_start():
         return False
 
 
+def _vpn_restart():
+    """Signal run.sh to re-parse config and restart sing-box."""
+    try:
+        open(VPN_RESTART_FLAG, "w").close()
+        return True
+    except Exception:
+        return False
+
+
 def _write_profile(idx):
-    """Persist selected_profile to options.json and trigger restart."""
     opts = _read_json(OPTIONS_FILE)
     opts["selected_profile"] = int(idx)
     try:
@@ -174,25 +250,22 @@ HTML = r"""<!DOCTYPE html>
   }
   .wrap { width: 100%; max-width: 580px; display: flex; flex-direction: column; gap: 14px; }
 
-  /* header */
   .header { display: flex; align-items: center; gap: 14px; }
   .logo svg { width: 42px; height: 42px; }
   .title-block h1 { font-size: 20px; font-weight: 700; }
   .title-block p  { font-size: 12px; color: var(--muted); margin-top: 2px; }
 
-  /* badge */
   .badge {
     display: inline-flex; align-items: center; gap: 7px;
     padding: 5px 13px; border-radius: 99px; font-size: 13px; font-weight: 600;
     background: var(--card); border: 1px solid var(--border); margin-left: auto;
   }
   .dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; box-shadow: 0 0 6px currentColor; }
-  .connected    .dot { background: var(--green);  color: var(--green);  }
+  .connected    .dot { background: var(--green);  color: var(--green); }
   .connecting   .dot { background: var(--yellow); color: var(--yellow); animation: pulse 1s infinite; }
   .disconnected .dot, .error .dot, .unknown .dot { background: var(--red); color: var(--red); }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
-  /* grid */
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .card {
     background: var(--card); border: 1px solid var(--border);
@@ -202,18 +275,15 @@ HTML = r"""<!DOCTYPE html>
   .card .value { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
   .card .sub   { font-size: 12px; color: var(--muted); margin-top: 4px; }
 
-  /* traffic */
   .card.traffic { grid-column: 1/-1; display: flex; padding: 0; overflow: hidden; }
   .th { flex: 1; padding: 18px 20px; }
   .th:first-child { border-right: 1px solid var(--border); }
   .rx .value { color: var(--blue);  }
   .tx .value { color: var(--green); }
 
-  /* ip / profile full-width */
   .card.fw { grid-column: 1/-1; }
   .card.fw .value { font-size: 16px; word-break: break-all; }
 
-  /* controls */
   .controls { display: flex; gap: 10px; flex-wrap: wrap; }
   .btn {
     flex: 1; min-width: 120px; padding: 13px 20px; border-radius: 10px;
@@ -227,7 +297,6 @@ HTML = r"""<!DOCTYPE html>
   .btn-off:hover { filter: brightness(1.15); }
   .btn:disabled { opacity: .45; cursor: default; }
 
-  /* profile selector */
   .profile-row { display: flex; align-items: center; gap: 10px; }
   select {
     flex: 1; background: var(--card); color: var(--text);
@@ -241,6 +310,33 @@ HTML = r"""<!DOCTYPE html>
   }
   .btn-switch:hover { filter: brightness(1.15); }
   .btn-switch:disabled { opacity: .4; cursor: default; }
+
+  /* Subscriptions */
+  .sub-list { display: flex; flex-direction: column; gap: 8px; }
+  .sub-item {
+    display: flex; align-items: center; gap: 10px;
+    background: rgba(0,0,0,.2); border-radius: 8px; padding: 10px 12px;
+  }
+  .sub-item-info { flex: 1; min-width: 0; }
+  .sub-item-name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub-item-url  { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub-item-count { font-size: 11px; color: var(--green); margin-top: 2px; }
+  .btn-sm {
+    padding: 6px 12px; border-radius: 6px; border: none;
+    font-size: 12px; font-weight: 600; cursor: pointer; flex-shrink: 0;
+  }
+  .btn-refresh { background: rgba(33,150,243,.2); color: var(--blue); }
+  .btn-remove  { background: rgba(244,67,54,.2);  color: var(--red); }
+  .btn-sm:hover { filter: brightness(1.3); }
+  .btn-sm:disabled { opacity: .4; cursor: default; }
+
+  .add-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  input[type=text], input[type=url] {
+    flex: 1; min-width: 0; background: var(--card); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 14px; font-size: 13px;
+  }
+  input::placeholder { color: var(--muted); }
 
   .msg { font-size: 13px; color: var(--muted); text-align: center; min-height: 20px; }
   .footer { text-align: center; font-size: 11px; color: var(--muted); padding-top: 2px; }
@@ -299,7 +395,7 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- speed test card -->
+  <!-- speed test -->
   <div class="card" style="display:flex;flex-direction:column;gap:10px">
     <div class="label" style="margin-bottom:0">Speed Test (via VPN)</div>
     <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
@@ -314,7 +410,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="msg" id="speed-msg"></div>
   </div>
 
-  <!-- controls -->
+  <!-- VPN controls + profile selector -->
   <div class="card" style="display:flex;flex-direction:column;gap:12px">
     <div class="label" style="margin-bottom:0">VPN Control</div>
     <div class="controls">
@@ -330,13 +426,32 @@ HTML = r"""<!DOCTYPE html>
     <div class="msg" id="msg"></div>
   </div>
 
-  <div class="footer">Updates every 2 s · Hiddify VPN 2.0.2</div>
+  <!-- Subscriptions management -->
+  <div class="card" style="display:flex;flex-direction:column;gap:12px">
+    <div class="label" style="margin-bottom:0">Subscriptions</div>
+
+    <div class="sub-list" id="sub-list">
+      <div style="font-size:13px;color:var(--muted)">Loading…</div>
+    </div>
+
+    <div class="label" style="margin-top:4px;margin-bottom:0">Add subscription</div>
+    <div class="add-row">
+      <input type="url" id="add-url" placeholder="https://… or vless://… or vmess://…" />
+    </div>
+    <div class="add-row">
+      <input type="text" id="add-name" placeholder="Name (optional)" style="flex:0 0 160px;min-width:120px"/>
+      <button class="btn-switch" id="btn-add" onclick="addSubscription()" style="flex:0 0 auto">+ Add</button>
+    </div>
+    <div class="msg" id="sub-msg"></div>
+  </div>
+
+  <div class="footer">Updates every 2 s · Hiddify VPN 2.1.0</div>
 </div>
 
 <script>
 let _uptimeSec = 0;
 let _tick = null;
-let _lastStatus = "";
+let _profiles = [];
 
 function fmt(b) {
   if (!b) return "0 B";
@@ -351,25 +466,48 @@ function fmtT(s) {
   const sc = String(s%60).padStart(2,"0");
   return `${h}:${m}:${sc}`;
 }
-function setMsg(t, ok=true) {
-  const el = document.getElementById("msg");
+function setMsg(id, t, ok=true) {
+  const el = document.getElementById(id);
   el.textContent = t;
   el.style.color = ok ? "var(--muted)" : "var(--red)";
-  if (t) setTimeout(()=>{ if(el.textContent===t) el.textContent=""; }, 4000);
+  if (t) setTimeout(()=>{ if(el.textContent===t) el.textContent=""; }, 5000);
 }
 
-function updateProfiles(profiles, selected) {
+function updateProfiles(profiles) {
+  _profiles = profiles || [];
   const sel = document.getElementById("profile-sel");
-  if (!profiles || !profiles.length) {
-    sel.innerHTML = '<option value="0">— no profiles —</option>';
+  if (!_profiles.length) {
+    sel.innerHTML = '<option value="">— add a subscription —</option>';
     document.getElementById("btn-switch").disabled = true;
     return;
   }
-  const cur = sel.value;
-  sel.innerHTML = profiles.map(p =>
-    `<option value="${p.index}" ${p.index==selected?"selected":""}>${p.name}</option>`
+  sel.innerHTML = _profiles.map((p, i) =>
+    `<option value="${i}" ${p.active ? "selected" : ""}>${p.name}</option>`
   ).join("");
   document.getElementById("btn-switch").disabled = false;
+}
+
+function updateSubscriptions(subs) {
+  const el = document.getElementById("sub-list");
+  if (!subs || !subs.length) {
+    el.innerHTML = '<div style="font-size:13px;color:var(--muted)">No subscriptions yet. Add one below.</div>';
+    return;
+  }
+  el.innerHTML = subs.map(s => `
+    <div class="sub-item">
+      <div class="sub-item-info">
+        <div class="sub-item-name">${escHtml(s.name)}</div>
+        <div class="sub-item-url">${escHtml(s.url_short)}</div>
+        <div class="sub-item-count">${s.profile_count} profile${s.profile_count !== 1 ? "s" : ""}</div>
+      </div>
+      <button class="btn-sm btn-refresh" onclick="refreshSub('${s.id}')" title="Re-fetch profiles">↻</button>
+      <button class="btn-sm btn-remove"  onclick="removeSub('${s.id}')"  title="Remove">✕</button>
+    </div>
+  `).join("");
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 }
 
 async function poll() {
@@ -378,20 +516,14 @@ async function poll() {
     if (!r.ok) throw new Error(r.status);
     const d = await r.json();
 
-    // badge
     const badge = document.getElementById("badge");
     badge.className = "badge " + (d.status || "unknown");
     document.getElementById("status-text").textContent = d.status || "unknown";
-
-    // ip / profile
     document.getElementById("ip").textContent      = d.ip      || "—";
     document.getElementById("profile").textContent = d.profile || "—";
-
-    // traffic
     document.getElementById("rx").textContent = fmt(d.rx_bytes);
     document.getElementById("tx").textContent = fmt(d.tx_bytes);
 
-    // uptime ticker
     _uptimeSec = d.uptime_seconds || 0;
     document.getElementById("uptime").textContent = fmtT(_uptimeSec);
     if (d.status === "connected") {
@@ -401,15 +533,12 @@ async function poll() {
       document.getElementById("uptime").textContent = "—";
     }
 
-    // buttons
     const running = (d.status === "connected" || d.status === "connecting");
     document.getElementById("btn-start").disabled = running;
     document.getElementById("btn-stop").disabled  = !running;
 
-    // profiles
-    updateProfiles(d.profiles, d.selected_profile);
-
-    _lastStatus = d.status;
+    updateProfiles(d.profiles);
+    updateSubscriptions(d.subscriptions);
   } catch(e) {
     document.getElementById("status-text").textContent = "unreachable";
   }
@@ -418,29 +547,86 @@ async function poll() {
 async function vpnAction(action) {
   document.getElementById("btn-start").disabled = true;
   document.getElementById("btn-stop").disabled  = true;
-  setMsg(action === "start" ? "Starting VPN…" : "Stopping VPN…");
+  setMsg("msg", action === "start" ? "Starting VPN…" : "Stopping VPN…");
   try {
     const r = await fetch(`vpn/${action}`, {method:"POST"});
     const d = await r.json();
-    setMsg(d.ok ? (action==="start"?"VPN starting…":"VPN stopped.") : ("Error: "+(d.error||"unknown")), d.ok);
+    setMsg("msg", d.ok ? (action==="start"?"VPN starting…":"VPN stopped.") : ("Error: "+(d.error||"unknown")), d.ok);
   } catch(e) {
-    setMsg("Request failed", false);
+    setMsg("msg", "Request failed", false);
   }
   setTimeout(poll, 2000);
 }
 
 async function switchProfile() {
-  const idx = document.getElementById("profile-sel").value;
+  const idx = parseInt(document.getElementById("profile-sel").value);
+  if (isNaN(idx) || !_profiles[idx]) return;
+  const p = _profiles[idx];
   document.getElementById("btn-switch").disabled = true;
-  setMsg("Switching profile…");
+  setMsg("msg", "Switching profile…");
   try {
-    const r = await fetch(`profile/set?index=${idx}`, {method:"POST"});
+    const params = p.sub_id
+      ? `sub_id=${encodeURIComponent(p.sub_id)}&index=${p.index}`
+      : `index=${p.index}`;
+    const r = await fetch(`profile/set?${params}`, {method:"POST"});
     const d = await r.json();
-    setMsg(d.ok ? "Profile saved. VPN restarting…" : ("Error: "+(d.error||"")), d.ok);
+    setMsg("msg", d.ok ? "Profile saved. VPN restarting…" : ("Error: "+(d.error||"")), d.ok);
   } catch(e) {
-    setMsg("Request failed", false);
+    setMsg("msg", "Request failed", false);
   }
   setTimeout(poll, 3000);
+}
+
+async function addSubscription() {
+  const url  = document.getElementById("add-url").value.trim();
+  const name = document.getElementById("add-name").value.trim();
+  if (!url) { setMsg("sub-msg", "Enter a URL", false); return; }
+  const btn = document.getElementById("btn-add");
+  btn.disabled = true;
+  setMsg("sub-msg", "Fetching profiles… (may take ~15 s)");
+  try {
+    const r = await fetch("subscription/add", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({url, name: name || url.slice(0,40)}),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      setMsg("sub-msg", `Added: ${d.profiles} profile${d.profiles!==1?"s":""}${d.existing?" (updated)":""}`);
+      document.getElementById("add-url").value  = "";
+      document.getElementById("add-name").value = "";
+      poll();
+    } else {
+      setMsg("sub-msg", "Error: " + (d.error || "unknown"), false);
+    }
+  } catch(e) {
+    setMsg("sub-msg", "Request failed", false);
+  }
+  btn.disabled = false;
+}
+
+async function refreshSub(id) {
+  setMsg("sub-msg", "Refreshing…");
+  try {
+    const r = await fetch(`subscription/refresh?id=${id}`, {method:"POST"});
+    const d = await r.json();
+    setMsg("sub-msg", d.ok ? `Refreshed: ${d.profiles} profiles` : ("Error: "+(d.error||"")), d.ok);
+    if (d.ok) poll();
+  } catch(e) {
+    setMsg("sub-msg", "Request failed", false);
+  }
+}
+
+async function removeSub(id) {
+  if (!confirm("Remove this subscription?")) return;
+  try {
+    const r = await fetch(`subscription/remove?id=${id}`, {method:"POST"});
+    const d = await r.json();
+    if (d.ok) poll();
+    else setMsg("sub-msg", "Error: " + (d.error||""), false);
+  } catch(e) {
+    setMsg("sub-msg", "Request failed", false);
+  }
 }
 
 async function runSpeed() {
@@ -501,17 +687,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _read_body_json(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if not length:
+            return {}
+        return json.loads(self.rfile.read(length))
+
     def do_GET(self):
         path = urlparse(self.path).path.rstrip("/") or "/"
 
         if path in ("/", "/index.html"):
             self._html(HTML)
 
-        elif path.endswith("/stats") or path == "/stats":
+        elif path.endswith("/stats"):
             self._json(200, _stats())
 
         elif path.endswith("/speedtest"):
-            # Long-running — run in thread so server stays responsive
             import threading
             result = {}
             def _run():
@@ -541,29 +732,118 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path.rstrip("/")
+        qs   = parse_qs(urlparse(self.path).query)
 
-        # VPN start / stop
+        # ── VPN control ────────────────────────────────────────────────────────
         if path.endswith("/vpn/start"):
-            ok = _vpn_start()
-            self._json(200, {"ok": ok})
+            self._json(200, {"ok": _vpn_start()})
 
         elif path.endswith("/vpn/stop"):
-            ok = _vpn_stop()
-            self._json(200, {"ok": ok})
+            self._json(200, {"ok": _vpn_stop()})
 
-        # Profile switch
+        # ── Profile switch ─────────────────────────────────────────────────────
         elif path.endswith("/profile/set"):
-            qs = parse_qs(urlparse(self.path).query)
-            idx_list = qs.get("index", ["0"])
+            sub_id = qs.get("sub_id", [""])[0]
             try:
-                idx = int(idx_list[0])
+                idx = int(qs.get("index", ["0"])[0])
             except ValueError:
                 self._json(400, {"ok": False, "error": "bad index"})
                 return
-            ok = _write_profile(idx)
-            if ok:
-                _addon_action("restart")
-            self._json(200, {"ok": ok})
+
+            if sub_id:
+                # Multi-subscription flow
+                subs = _read_subscriptions()
+                sub  = next((s for s in subs if s["id"] == sub_id), None)
+                if not sub:
+                    self._json(404, {"ok": False, "error": "subscription not found"})
+                    return
+                profiles = sub.get("profiles", [])
+                pname    = profiles[idx]["name"] if idx < len(profiles) else str(idx)
+                _write_json(ACTIVE_PROFILE_FILE, {
+                    "sub_id": sub_id, "profile_index": idx, "profile_name": pname,
+                })
+                _vpn_restart()
+                self._json(200, {"ok": True})
+            else:
+                # Legacy single-subscription flow
+                ok = _write_profile(idx)
+                if ok:
+                    _vpn_restart()
+                self._json(200, {"ok": ok})
+
+        # ── Subscription management ────────────────────────────────────────────
+        elif path.endswith("/subscription/add"):
+            try:
+                body  = self._read_body_json()
+                url   = body.get("url", "").strip()
+                name  = body.get("name", "").strip() or url[:40]
+                if not url:
+                    self._json(400, {"ok": False, "error": "url required"})
+                    return
+
+                profiles = _fetch_profiles_for_url(url)
+                subs     = _read_subscriptions()
+
+                # Update if URL already exists
+                for s in subs:
+                    if s["url"] == url:
+                        s["profiles"] = profiles
+                        s["name"]     = name or s["name"]
+                        _write_json(SUBSCRIPTIONS_FILE, subs)
+                        self._json(200, {"ok": True, "profiles": len(profiles), "existing": True})
+                        return
+
+                sub_id = str(uuid.uuid4())[:8]
+                subs.append({"id": sub_id, "url": url, "name": name, "profiles": profiles})
+                _write_json(SUBSCRIPTIONS_FILE, subs)
+
+                # Auto-select first profile if this is the first subscription
+                if len(subs) == 1 and profiles:
+                    _write_json(ACTIVE_PROFILE_FILE, {
+                        "sub_id": sub_id, "profile_index": 0,
+                        "profile_name": profiles[0]["name"],
+                    })
+
+                self._json(200, {"ok": True, "id": sub_id, "profiles": len(profiles), "existing": False})
+
+            except Exception as e:
+                self._json(500, {"ok": False, "error": str(e)})
+
+        elif path.endswith("/subscription/remove"):
+            sub_id = qs.get("id", [""])[0]
+            subs   = _read_subscriptions()
+            subs   = [s for s in subs if s["id"] != sub_id]
+            _write_json(SUBSCRIPTIONS_FILE, subs)
+            # Clear active profile if it was from this subscription
+            active = _read_active_profile()
+            if active.get("sub_id") == sub_id:
+                if subs and subs[0].get("profiles"):
+                    first = subs[0]
+                    _write_json(ACTIVE_PROFILE_FILE, {
+                        "sub_id": first["id"],
+                        "profile_index": 0,
+                        "profile_name": first["profiles"][0]["name"],
+                    })
+                else:
+                    try:
+                        os.remove(ACTIVE_PROFILE_FILE)
+                    except Exception:
+                        pass
+            self._json(200, {"ok": True})
+
+        elif path.endswith("/subscription/refresh"):
+            sub_id = qs.get("id", [""])[0]
+            subs   = _read_subscriptions()
+            for s in subs:
+                if s["id"] == sub_id:
+                    try:
+                        s["profiles"] = _fetch_profiles_for_url(s["url"])
+                        _write_json(SUBSCRIPTIONS_FILE, subs)
+                        self._json(200, {"ok": True, "profiles": len(s["profiles"])})
+                    except Exception as e:
+                        self._json(500, {"ok": False, "error": str(e)})
+                    return
+            self._json(404, {"ok": False, "error": "subscription not found"})
 
         else:
             self.send_response(404)
