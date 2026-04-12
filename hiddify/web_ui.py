@@ -94,17 +94,21 @@ def _stats():
 
     all_profiles = []
     for sub in subs:
+        custom_names = sub.get("custom_names", {})  # {str(index): custom_name}
         for p in sub.get("profiles", []):
-            label = p["name"] if len(subs) <= 1 else f"[{sub['name']}] {p['name']}"
-            is_active = (
+            orig_name   = p["name"]
+            display     = custom_names.get(str(p["index"]), orig_name)
+            label       = display if len(subs) <= 1 else f"[{sub['name']}] {display}"
+            is_active   = (
                 sub["id"] == active.get("sub_id")
                 and p["index"] == active.get("profile_index", -1)
             )
             all_profiles.append({
-                "sub_id": sub["id"],
-                "index":  p["index"],
-                "name":   label,
-                "active": is_active,
+                "sub_id":    sub["id"],
+                "index":     p["index"],
+                "name":      label,
+                "orig_name": orig_name,
+                "active":    is_active,
             })
 
     # Fallback: legacy profiles.json (before multi-sub)
@@ -132,9 +136,19 @@ def _stats():
             "name":          s["name"],
             "url_short":     s["url"][:50] + ("…" if len(s["url"]) > 50 else ""),
             "profile_count": len(s.get("profiles", [])),
+            "profiles":      [
+                {
+                    "index":       p["index"],
+                    "name":        p["name"],
+                    "custom_name": s.get("custom_names", {}).get(str(p["index"]), ""),
+                }
+                for p in s.get("profiles", [])
+            ],
         }
         for s in subs
     ]
+
+    grpc_up = _grpc_port_open()
 
     return {
         "status":           state.get("status", "unknown"),
@@ -145,6 +159,7 @@ def _stats():
         "tx_bytes":         tx,
         "profiles":         all_profiles,
         "subscriptions":    subs_summary,
+        "grpc_up":          grpc_up,
     }
 
 
@@ -177,6 +192,209 @@ def _run_speedtest():
         except Exception as e:
             last_err = str(e)
     return {"ok": False, "error": last_err or "all URLs failed"}
+
+
+# ── gRPC helpers (raw HTTP/2, no deps) ────────────────────────────────────────
+
+GRPC_PORT = 17078
+
+def _grpc_call(method, body=b'', port=GRPC_PORT, timeout=8):
+    import socket, struct
+    def h2f(t, f, sid, p=b''):
+        return struct.pack('>I', len(p))[1:] + bytes([t, f]) + struct.pack('>I', sid) + p
+    def hs(s):
+        b = s.encode() if isinstance(s, str) else s
+        return bytes([len(b)]) + b
+
+    hpack = (
+        bytes([0x83, 0x86])
+        + bytes([0x44]) + hs(method)
+        + bytes([0x41]) + hs(f'127.0.0.1:{port}')
+        + bytes([0x40]) + hs('content-type') + hs('application/grpc')
+        + bytes([0x40]) + hs('te') + hs('trailers')
+    )
+    msg = b'\x00' + struct.pack('>I', len(body)) + body
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(('127.0.0.1', port))
+        s.sendall(
+            b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
+            + h2f(0x04, 0x00, 0)
+            + h2f(0x01, 0x04, 1, hpack)
+            + h2f(0x00, 0x01, 1, msg)
+        )
+        resp = b''
+        while True:
+            try:
+                chunk = s.recv(4096)
+                if not chunk: break
+                resp += chunk
+            except socket.timeout:
+                break
+        s.close()
+        return True, resp
+    except Exception as e:
+        return False, b''
+
+def _grpc_port_open(port=GRPC_PORT):
+    import socket
+    try:
+        s = socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', port)); s.close(); return True
+    except Exception:
+        return False
+
+def _pb_string(field, value):
+    """Encode protobuf string field."""
+    import struct
+    b = value.encode() if isinstance(value, str) else value
+    tag = bytes([(field << 3) | 2])
+    n = len(b)
+    if n < 128:
+        return tag + bytes([n]) + b
+    return tag + bytes([(n & 0x7F) | 0x80, n >> 7]) + b
+
+def _grpc_url_test(tag=''):
+    """Call Core.UrlTest to ping outbounds. Empty tag = test all."""
+    body = _pb_string(1, tag) if tag else b''
+    ok, _ = _grpc_call('/hcore.Core/UrlTest', body)
+    return ok
+
+def _grpc_url_test_active():
+    """Call Core.UrlTestActive — tests only the currently selected outbound."""
+    ok, _ = _grpc_call('/hcore.Core/UrlTestActive', b'')
+    return ok
+
+def _grpc_select_outbound(group_tag, outbound_tag):
+    """Call Core.SelectOutbound to switch to a specific server."""
+    body = _pb_string(1, group_tag) + _pb_string(2, outbound_tag)
+    ok, _ = _grpc_call('/hcore.Core/SelectOutbound', body)
+    return ok
+
+def _grpc_get_outbounds():
+    """
+    Call Core.MainOutboundsInfo — returns a stream of OutboundGroupList.
+    We read one frame and decode the protobuf minimally.
+    Returns list of {group_tag, group_type, selected, items:[{tag,type,delay}]}
+    """
+    import struct
+    ok, raw = _grpc_call('/hcore.Core/MainOutboundsInfo', b'', timeout=6)
+    if not ok or not raw:
+        return []
+
+    # Find DATA frame (type 0x00) in HTTP/2 response
+    grpc_data = b''
+    i = 0
+    while i + 9 <= len(raw):
+        frame_len  = struct.unpack('>I', b'\x00' + raw[i:i+3])[0]
+        frame_type = raw[i+3]
+        payload    = raw[i+9:i+9+frame_len]
+        if frame_type == 0x00 and len(payload) >= 5:
+            grpc_len = struct.unpack('>I', payload[1:5])[0]
+            grpc_data = payload[5:5+grpc_len]
+            break
+        i += 9 + frame_len
+
+    if not grpc_data:
+        return []
+
+    return _decode_outbound_group_list(grpc_data)
+
+def _decode_varint(data, pos):
+    result, shift = 0, 0
+    while pos < len(data):
+        b = data[pos]; pos += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80): break
+        shift += 7
+    return result, pos
+
+def _decode_len_delimited(data, pos):
+    length, pos = _decode_varint(data, pos)
+    return data[pos:pos+length], pos+length
+
+def _decode_string(data, pos):
+    b, pos = _decode_len_delimited(data, pos)
+    return b.decode('utf-8', errors='replace'), pos
+
+def _decode_outbound_group_list(data):
+    """Minimal decoder for OutboundGroupList protobuf."""
+    groups = []
+    pos = 0
+    while pos < len(data):
+        if pos >= len(data): break
+        tag_byte = data[pos]; pos += 1
+        field = tag_byte >> 3
+        wire  = tag_byte & 0x07
+        if wire == 2:  # length-delimited
+            sub, pos = _decode_len_delimited(data, pos)
+            if field == 1:  # OutboundGroup
+                groups.append(_decode_outbound_group(sub))
+        elif wire == 0:
+            _, pos = _decode_varint(data, pos)
+        elif wire == 5:
+            pos += 4
+        elif wire == 1:
+            pos += 8
+        else:
+            break
+    return groups
+
+def _decode_outbound_group(data):
+    group = {"tag": "", "type": "", "selected": "", "selectable": False, "items": []}
+    pos = 0
+    while pos < len(data):
+        if pos >= len(data): break
+        tag_byte = data[pos]; pos += 1
+        field = tag_byte >> 3
+        wire  = tag_byte & 0x07
+        if wire == 2:
+            sub, pos = _decode_len_delimited(data, pos)
+            if field == 1:
+                group["tag"] = sub.decode('utf-8', errors='replace')
+            elif field == 2:
+                group["type"] = sub.decode('utf-8', errors='replace')
+            elif field == 3:
+                group["selected"] = sub.decode('utf-8', errors='replace')
+            elif field == 6:
+                group["items"].append(_decode_outbound_info(sub))
+        elif wire == 0:
+            val, pos = _decode_varint(data, pos)
+            if field == 4:
+                group["selectable"] = bool(val)
+        elif wire == 5:
+            pos += 4
+        elif wire == 1:
+            pos += 8
+        else:
+            break
+    return group
+
+def _decode_outbound_info(data):
+    info = {"tag": "", "type": "", "delay": 0}
+    pos = 0
+    while pos < len(data):
+        if pos >= len(data): break
+        tag_byte = data[pos]; pos += 1
+        field = tag_byte >> 3
+        wire  = tag_byte & 0x07
+        if wire == 2:
+            sub, pos = _decode_len_delimited(data, pos)
+            if field == 1:
+                info["tag"] = sub.decode('utf-8', errors='replace')
+            elif field == 2:
+                info["type"] = sub.decode('utf-8', errors='replace')
+        elif wire == 0:
+            val, pos = _decode_varint(data, pos)
+            if field == 4:
+                info["delay"] = val  # url_test_delay in ms
+        elif wire == 5:
+            pos += 4
+        elif wire == 1:
+            pos += 8
+        else:
+            break
+    return info
 
 
 def _vpn_stop():
@@ -340,6 +558,23 @@ HTML = r"""<!DOCTYPE html>
 
   .msg { font-size: 13px; color: var(--muted); text-align: center; min-height: 20px; }
   .footer { text-align: center; font-size: 11px; color: var(--muted); padding-top: 2px; }
+
+  /* Profile rename inline */
+  .profile-edit-row { display:flex; align-items:center; gap:6px; margin-top:4px; }
+  .profile-edit-row input { flex:1; padding:5px 8px; font-size:12px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text); }
+  .btn-save { padding:5px 10px; border-radius:6px; border:none; background:rgba(76,175,80,.25); color:var(--green); font-size:12px; font-weight:600; cursor:pointer; }
+  .btn-save:hover { filter:brightness(1.3); }
+
+  /* Server list */
+  .server-item { display:flex; align-items:center; gap:8px; padding:8px 10px; border-radius:8px; background:rgba(0,0,0,.2); cursor:pointer; transition:background .15s; }
+  .server-item:hover { background:rgba(255,255,255,.05); }
+  .server-item.active { background:rgba(76,175,80,.12); border:1px solid rgba(76,175,80,.3); }
+  .server-tag { flex:1; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .server-delay { font-size:11px; font-weight:600; min-width:45px; text-align:right; }
+  .delay-good { color:var(--green); }
+  .delay-ok   { color:var(--yellow); }
+  .delay-bad  { color:var(--red); }
+  .delay-none { color:var(--muted); }
 </style>
 </head>
 <body>
@@ -445,7 +680,21 @@ HTML = r"""<!DOCTYPE html>
     <div class="msg" id="sub-msg"></div>
   </div>
 
-  <div class="footer">Updates every 2 s · Hiddify VPN 2.1.0</div>
+  <!-- Server selector (shown when VPN connected and gRPC available) -->
+  <div class="card" id="server-card" style="display:none;flex-direction:column;gap:12px">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <div class="label" style="margin-bottom:0;flex:1">Servers</div>
+      <button class="btn-sm btn-refresh" id="btn-urltest" onclick="runUrlTest()" style="padding:7px 14px;font-size:13px">
+        ⚡ Test All
+      </button>
+    </div>
+    <div id="server-list" style="display:flex;flex-direction:column;gap:6px">
+      <div style="font-size:12px;color:var(--muted)">Click "Test All" to load servers</div>
+    </div>
+    <div class="msg" id="server-msg"></div>
+  </div>
+
+  <div class="footer">Updates every 2 s · Hiddify VPN 2.2.0</div>
 </div>
 
 <script>
@@ -494,14 +743,29 @@ function updateSubscriptions(subs) {
     return;
   }
   el.innerHTML = subs.map(s => `
-    <div class="sub-item">
-      <div class="sub-item-info">
-        <div class="sub-item-name">${escHtml(s.name)}</div>
-        <div class="sub-item-url">${escHtml(s.url_short)}</div>
-        <div class="sub-item-count">${s.profile_count} profile${s.profile_count !== 1 ? "s" : ""}</div>
+    <div class="sub-item" style="flex-direction:column;align-items:stretch;gap:8px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div class="sub-item-info">
+          <div class="sub-item-name">${escHtml(s.name)}</div>
+          <div class="sub-item-url">${escHtml(s.url_short)}</div>
+          <div class="sub-item-count">${s.profile_count} profile${s.profile_count !== 1 ? "s" : ""}</div>
+        </div>
+        <button class="btn-sm btn-refresh" onclick="refreshSub('${s.id}')" title="Re-fetch profiles">↻</button>
+        <button class="btn-sm btn-remove"  onclick="removeSub('${s.id}')"  title="Remove">✕</button>
       </div>
-      <button class="btn-sm btn-refresh" onclick="refreshSub('${s.id}')" title="Re-fetch profiles">↻</button>
-      <button class="btn-sm btn-remove"  onclick="removeSub('${s.id}')"  title="Remove">✕</button>
+      ${s.profiles && s.profiles.length ? `
+      <div style="padding-left:4px;display:flex;flex-direction:column;gap:4px">
+        ${s.profiles.map(p => `
+        <div>
+          <div style="font-size:12px;color:var(--muted)">${escHtml(p.name)}</div>
+          <div class="profile-edit-row">
+            <input type="text" id="rename-${s.id}-${p.index}"
+              value="${escHtml(p.custom_name)}"
+              placeholder="Custom name (optional)"/>
+            <button class="btn-save" onclick="renameProfile('${s.id}',${p.index})">Save</button>
+          </div>
+        </div>`).join("")}
+      </div>` : ""}
     </div>
   `).join("");
 }
@@ -539,6 +803,10 @@ async function poll() {
 
     updateProfiles(d.profiles);
     updateSubscriptions(d.subscriptions);
+
+    // Show server panel only when VPN is running and gRPC available
+    const serverCard = document.getElementById("server-card");
+    if (serverCard) serverCard.style.display = d.grpc_up ? "flex" : "none";
   } catch(e) {
     document.getElementById("status-text").textContent = "unreachable";
   }
@@ -626,6 +894,99 @@ async function removeSub(id) {
     else setMsg("sub-msg", "Error: " + (d.error||""), false);
   } catch(e) {
     setMsg("sub-msg", "Request failed", false);
+  }
+}
+
+async function renameProfile(subId, idx) {
+  const inp = document.getElementById(`rename-${subId}-${idx}`);
+  if (!inp) return;
+  const name = inp.value.trim();
+  try {
+    const r = await fetch("profile/rename", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({sub_id: subId, index: idx, name}),
+    });
+    const d = await r.json();
+    setMsg("sub-msg", d.ok ? "Name saved" : ("Error: " + (d.error||"")), d.ok);
+    if (d.ok) poll();
+  } catch(e) {
+    setMsg("sub-msg", "Request failed", false);
+  }
+}
+
+let _serverGroups = [];
+
+async function runUrlTest() {
+  const btn = document.getElementById("btn-urltest");
+  btn.disabled = true;
+  btn.textContent = "Testing…";
+  setMsg("server-msg", "Pinging servers…");
+  try {
+    await fetch("server/urltest", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+    // Wait a moment for results to populate
+    await new Promise(r => setTimeout(r, 2500));
+    await loadServers();
+    setMsg("server-msg", "Done");
+    setTimeout(() => { if(document.getElementById("server-msg").textContent==="Done") document.getElementById("server-msg").textContent=""; }, 3000);
+  } catch(e) {
+    setMsg("server-msg", "Request failed", false);
+  }
+  btn.disabled = false;
+  btn.textContent = "⚡ Test All";
+}
+
+async function loadServers() {
+  try {
+    const r = await fetch("server/list", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+    if (!r.ok) return;
+    const d = await r.json();
+    if (!d.ok || !d.groups) return;
+    _serverGroups = d.groups.filter(g => g.selectable && g.items && g.items.length);
+    renderServers();
+  } catch(e) {}
+}
+
+function renderServers() {
+  const el = document.getElementById("server-list");
+  if (!_serverGroups.length) {
+    el.innerHTML = '<div style="font-size:12px;color:var(--muted)">No selectable groups found. Click "Test All" first.</div>';
+    return;
+  }
+  el.innerHTML = _serverGroups.map(g => `
+    <div>
+      <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">${escHtml(g.tag)}</div>
+      ${g.items.map(item => {
+        const delay = item.delay || 0;
+        const cls   = !delay ? "delay-none" : delay < 300 ? "delay-good" : delay < 800 ? "delay-ok" : "delay-bad";
+        const lbl   = !delay ? "—" : delay + " ms";
+        const active = item.tag === g.selected ? " active" : "";
+        return `<div class="server-item${active}" onclick="selectServer('${escHtml(g.tag)}','${escHtml(item.tag)}')">
+          <div class="server-tag">${escHtml(item.tag)}</div>
+          <div class="server-delay ${cls}">${lbl}</div>
+        </div>`;
+      }).join("")}
+    </div>
+  `).join("");
+}
+
+async function selectServer(groupTag, outboundTag) {
+  setMsg("server-msg", `Switching to ${outboundTag}…`);
+  try {
+    const r = await fetch("server/select", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({group_tag: groupTag, outbound_tag: outboundTag}),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      setMsg("server-msg", `Active: ${outboundTag}`);
+      setTimeout(loadServers, 500);
+    } else {
+      setMsg("server-msg", "Error: " + (d.error||""), false);
+    }
+  } catch(e) {
+    setMsg("server-msg", "Request failed", false);
   }
 }
 
@@ -853,6 +1214,60 @@ class Handler(BaseHTTPRequestHandler):
                         self._json(500, {"ok": False, "error": str(e)})
                     return
             self._json(404, {"ok": False, "error": "subscription not found"})
+
+        # ── Custom profile name ────────────────────────────────────────────────
+        elif path.endswith("/profile/rename"):
+            try:
+                body    = self._read_body_json()
+                sub_id  = body.get("sub_id", "")
+                idx     = int(body.get("index", 0))
+                new_name = body.get("name", "").strip()
+                subs = _read_subscriptions()
+                for s in subs:
+                    if s["id"] == sub_id:
+                        names = s.setdefault("custom_names", {})
+                        if new_name:
+                            names[str(idx)] = new_name
+                        else:
+                            names.pop(str(idx), None)  # reset to original
+                        _write_json(SUBSCRIPTIONS_FILE, subs)
+                        self._json(200, {"ok": True})
+                        return
+                self._json(404, {"ok": False, "error": "subscription not found"})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": str(e)})
+
+        # ── Server change (URL test + select best) ─────────────────────────────
+        elif path.endswith("/server/urltest"):
+            if not _grpc_port_open():
+                self._json(503, {"ok": False, "error": "VPN not running (gRPC unavailable)"})
+                return
+            tag = self._read_body_json().get("tag", "")
+            ok  = _grpc_url_test(tag)
+            self._json(200, {"ok": ok})
+
+        elif path.endswith("/server/list"):
+            if not _grpc_port_open():
+                self._json(503, {"ok": False, "error": "VPN not running"})
+                return
+            groups = _grpc_get_outbounds()
+            self._json(200, {"ok": True, "groups": groups})
+
+        elif path.endswith("/server/select"):
+            try:
+                body        = self._read_body_json()
+                group_tag   = body.get("group_tag", "select")
+                outbound_tag = body.get("outbound_tag", "")
+                if not outbound_tag:
+                    self._json(400, {"ok": False, "error": "outbound_tag required"})
+                    return
+                if not _grpc_port_open():
+                    self._json(503, {"ok": False, "error": "VPN not running"})
+                    return
+                ok = _grpc_select_outbound(group_tag, outbound_tag)
+                self._json(200, {"ok": ok})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": str(e)})
 
         else:
             self.send_response(404)
