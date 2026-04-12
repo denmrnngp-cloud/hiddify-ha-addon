@@ -20,44 +20,82 @@ TUN_MODE=$(jq -r '.tun_mode // true' "$CONFIG_JSON")
 LOG_LEVEL=$(jq -r '.log_level // "info"' "$CONFIG_JSON")
 PROXY_DOMAINS=$(jq -r '.proxy_domains // ""' "$CONFIG_JSON")
 
-# Priority: options.json (HA config) wins if user changed it after last UI selection.
-# If options.json URL matches a subscription in subscriptions.json → use that sub + index.
-# Otherwise fall back to active_profile.json, then plain options.json.
-_OPT_URL=$(jq -r '.subscription_url // ""' "$CONFIG_JSON")
-_OPT_IDX=$(jq -r '.selected_profile // 0' "$CONFIG_JSON")
+# ── Import subscription_urls from HA config into subscriptions.json ────────────
+# Each URL in subscription_urls not yet tracked gets auto-imported with profile fetch.
+python3 << 'PYEOF'
+import json, os, subprocess
 
+CONFIG_JSON        = "/data/options.json"
+SUBSCRIPTIONS_FILE = "/data/hiddify/subscriptions.json"
+
+def load(p, d):
+    try: return json.load(open(p))
+    except Exception: return d
+
+opts = load(CONFIG_JSON, {})
+subs = load(SUBSCRIPTIONS_FILE, [])
+
+# Support both subscription_urls (list) and legacy subscription_url (str)
+urls_from_config = opts.get("subscription_urls") or []
+if not urls_from_config:
+    single = opts.get("subscription_url", "")
+    if single: urls_from_config = [single]
+
+known_urls = {s["url"] for s in subs}
+changed = False
+for url in urls_from_config:
+    url = url.strip()
+    if not url or url in known_urls: continue
+    print(f"[hiddify] Auto-importing: {url[:60]}...", flush=True)
+    try:
+        r = subprocess.run(
+            ["python3", "/parse_sub.py", "--url", url, "--list", "--out", "/tmp/probe_import.json"],
+            capture_output=True, text=True, timeout=30,
+        )
+        names    = json.loads(r.stdout.strip()) if r.returncode == 0 else []
+        profiles = [{"index": i, "name": n} for i, n in enumerate(names)]
+    except Exception as e:
+        print(f"[hiddify] Fetch failed: {e}", flush=True)
+        profiles = []
+    import uuid as _u
+    name = url.split("#")[-1] if "#" in url else url[:40]
+    subs.append({"id": str(_u.uuid4())[:8], "url": url, "name": name, "profiles": profiles})
+    known_urls.add(url)
+    changed = True
+    print(f"[hiddify] Imported '{name}' ({len(profiles)} profiles)", flush=True)
+
+if changed:
+    os.makedirs(os.path.dirname(SUBSCRIPTIONS_FILE), exist_ok=True)
+    json.dump(subs, open(SUBSCRIPTIONS_FILE, "w"), indent=2, ensure_ascii=False)
+    print(f"[hiddify] subscriptions.json: {len(subs)} total", flush=True)
+PYEOF
+
+# active_profile.json (written by UI) is the single source of truth.
+# If it exists → use it. Otherwise fall back to first subscription / options.json.
 if [ -f "$ACTIVE_PROFILE_FILE" ] && [ -f "$SUBSCRIPTIONS_FILE" ]; then
     _ACTIVE_SUB_ID=$(jq -r '.sub_id // ""' "$ACTIVE_PROFILE_FILE")
     _ACTIVE_IDX=$(jq -r '.profile_index // 0' "$ACTIVE_PROFILE_FILE")
     _ACTIVE_URL=$(jq -r --arg id "$_ACTIVE_SUB_ID" '.[] | select(.id == $id) | .url' "$SUBSCRIPTIONS_FILE" 2>/dev/null || echo "")
-
-    # If HA config URL matches active subscription → use HA config index (user may have changed it)
-    if [ -n "$_OPT_URL" ] && [ "$_OPT_URL" = "$_ACTIVE_URL" ]; then
-        SUB_URL="$_OPT_URL"
-        PROFILE_IDX="$_OPT_IDX"
-        echo "[hiddify] Using HA config profile index: $PROFILE_IDX from sub: ${SUB_URL:0:50}..."
-    # If HA config URL differs → user picked a different sub via HA config, find it in subs list
-    elif [ -n "$_OPT_URL" ] && [ "$_OPT_URL" != "$_ACTIVE_URL" ]; then
-        _OPT_SUB_ID=$(jq -r --arg url "$_OPT_URL" '.[] | select(.url == $url) | .id' "$SUBSCRIPTIONS_FILE" 2>/dev/null || echo "")
-        if [ -n "$_OPT_SUB_ID" ]; then
-            SUB_URL="$_OPT_URL"
-            PROFILE_IDX="$_OPT_IDX"
-            # Sync active_profile.json
-            echo "{\"sub_id\":\"$_OPT_SUB_ID\",\"profile_index\":$PROFILE_IDX}" > "$ACTIVE_PROFILE_FILE"
-            echo "[hiddify] HA config changed subscription: sub_id=$_OPT_SUB_ID profile=$PROFILE_IDX"
-        else
-            SUB_URL="$_ACTIVE_URL"
-            PROFILE_IDX="$_ACTIVE_IDX"
-            echo "[hiddify] Using UI-selected subscription: sub_id=$_ACTIVE_SUB_ID profile=$PROFILE_IDX"
-        fi
-    else
+    if [ -n "$_ACTIVE_URL" ]; then
         SUB_URL="$_ACTIVE_URL"
         PROFILE_IDX="$_ACTIVE_IDX"
-        echo "[hiddify] Using UI-selected subscription: sub_id=$_ACTIVE_SUB_ID profile=$PROFILE_IDX"
+        echo "[hiddify] Active profile: sub=$_ACTIVE_SUB_ID idx=$PROFILE_IDX url=${SUB_URL:0:50}..."
+    else
+        # Active sub was removed — fall back to first available
+        SUB_URL=$(jq -r '.[0].url // ""' "$SUBSCRIPTIONS_FILE" 2>/dev/null || echo "")
+        PROFILE_IDX=0
+        echo "[hiddify] Active sub not found, falling back to first subscription"
     fi
+elif [ -f "$SUBSCRIPTIONS_FILE" ]; then
+    # No active profile yet — use first subscription, first profile
+    SUB_URL=$(jq -r '.[0].url // ""' "$SUBSCRIPTIONS_FILE" 2>/dev/null || echo "")
+    PROFILE_IDX=0
+    echo "[hiddify] No active profile, using first subscription"
 else
-    SUB_URL="$_OPT_URL"
-    PROFILE_IDX="$_OPT_IDX"
+    # Legacy: no subscriptions.json → use options.json directly
+    SUB_URL=$(jq -r '.subscription_url // (.subscription_urls[0] // "")' "$CONFIG_JSON")
+    PROFILE_IDX=$(jq -r '.selected_profile // 0' "$CONFIG_JSON")
+    echo "[hiddify] Legacy mode: url=${SUB_URL:0:50}... idx=$PROFILE_IDX"
 fi
 
 echo "[hiddify] Starting Hiddify VPN add-on"
