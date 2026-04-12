@@ -40,6 +40,7 @@ COPY run.sh /run.sh
 COPY parse_sub.py /parse_sub.py
 COPY grpc_ctl.py /grpc_ctl.py
 COPY web_ui.py /web_ui.py
+COPY vpn_monitor.py /vpn_monitor.py
 COPY hiddify-icons.js /hiddify-icons.js
 COPY icon.png /icon.png
 

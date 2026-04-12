@@ -288,9 +288,10 @@ monitor_loop() {
 cleanup() {
     echo "[hiddify] Stopping..."
     ha_state "disconnected" "" ""
-    [ -n "${HIDDIFY_PID:-}" ] && kill "$HIDDIFY_PID" 2>/dev/null || true
+    [ -n "${WATCHDOG_PID:-}" ] && kill "$WATCHDOG_PID" 2>/dev/null || true
+    [ -n "${HIDDIFY_PID:-}" ]  && kill "$HIDDIFY_PID"  2>/dev/null || true
     wait "${HIDDIFY_PID:-}" 2>/dev/null || true
-    [ -n "${WEB_PID:-}" ]  && kill "$WEB_PID"  2>/dev/null || true
+    [ -n "${WEB_PID:-}" ]      && kill "$WEB_PID"       2>/dev/null || true
     ip link delete tun0 2>/dev/null || true
     exit 0
 }
@@ -381,6 +382,10 @@ echo "[hiddify] Starting web dashboard on :8080"
 WEB_PORT=8080 python3 /web_ui.py 2>&1 | while IFS= read -r line; do echo "[web] $line"; done &
 WEB_PID=$!
 
+# Start connection monitor (reconnect / server cycle / profile failover)
+python3 /vpn_monitor.py 2>&1 | while IFS= read -r line; do echo "[watchdog] $line"; done &
+WATCHDOG_PID=$!
+
 # Start monitor in background
 monitor_loop "$PROFILE_NAME" &
 MONITOR_PID=$!
@@ -394,9 +399,10 @@ while true; do
     if [ -f /data/hiddify/vpn_restart_requested ]; then
         echo "[hiddify] Restart requested (profile switch)"
         rm -f /data/hiddify/vpn_restart_requested
-        kill "$MONITOR_PID" 2>/dev/null || true
-        kill "$HIDDIFY_PID" 2>/dev/null || true
-        wait "$HIDDIFY_PID" 2>/dev/null || true
+        kill "$WATCHDOG_PID" 2>/dev/null || true
+        kill "$MONITOR_PID"  2>/dev/null || true
+        kill "$HIDDIFY_PID"  2>/dev/null || true
+        wait "$HIDDIFY_PID"  2>/dev/null || true
         ip link delete tun0 2>/dev/null || true
         ha_state "connecting" "" "Reloading profile…"
 
@@ -410,6 +416,8 @@ while true; do
 
         PROFILE_NAME=$(parse_config) || { sleep 60; exit 1; }
         start_singbox
+        python3 /vpn_monitor.py 2>&1 | while IFS= read -r line; do echo "[watchdog] $line"; done &
+        WATCHDOG_PID=$!
         monitor_loop "$PROFILE_NAME" &
         MONITOR_PID=$!
         continue
